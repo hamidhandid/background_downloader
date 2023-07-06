@@ -41,7 +41,7 @@ android {
     }
 
     defaultConfig {
-        minSdkVersion 24
+        minSdkVersion 21
     }
 
     namespace 'com.bbflight.background_downloader'
