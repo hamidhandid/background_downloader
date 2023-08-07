@@ -5,7 +5,10 @@ import 'dart:isolate';
 import 'dart:math';
 
 import 'package:async/async.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
@@ -24,7 +27,7 @@ const okResponses = [200, 201, 202, 203, 204, 205, 206];
 /// in Dart, as there is no native platform equivalent of URLSession or
 /// WorkManager as there is on iOS and Android
 final class DesktopDownloader extends BaseDownloader {
-  final _log = Logger('DesktopDownloader');
+  static final _log = Logger('DesktopDownloader');
   final maxConcurrent = 5;
   static final DesktopDownloader _singleton = DesktopDownloader._internal();
   final _queue = Queue<Task>();
@@ -32,7 +35,10 @@ final class DesktopDownloader extends BaseDownloader {
   final _resume = <Task>{};
   final _isolateSendPorts =
       <Task, SendPort?>{}; // isolate SendPort for running task
-  static final httpClient = http.Client();
+  static var httpClient = http.Client();
+  static Duration? _requestTimeout;
+  static var _proxy = <String, dynamic>{}; // 'address' and 'port'
+  static var _bypassTLSCertificateValidation = false;
 
   factory DesktopDownloader() => _singleton;
 
@@ -75,7 +81,7 @@ final class DesktopDownloader extends BaseDownloader {
   Future<void> _executeTask(Task task) async {
     final data = await getResumeData(task.taskId);
     final isResume = _resume.remove(task) && data != null;
-    final filePath = await task.filePath();
+    final filePath = await task.filePath(); // "" for MultiUploadTask
     final tempFilePath = isResume
         ? data.data // always non-null
         : path.join((await getTemporaryDirectory()).path,
@@ -91,11 +97,26 @@ final class DesktopDownloader extends BaseDownloader {
           task, TaskStatus.failed, TaskException(exceptionDescription)));
       receivePort.close(); // also ends listener at then end
     });
-    await Isolate.spawn(doTask, receivePort.sendPort,
+    RootIsolateToken? rootIsolateToken = RootIsolateToken.instance;
+    if (rootIsolateToken == null) {
+      processStatusUpdate(TaskStatusUpdate(task, TaskStatus.failed,
+          TaskException('Could not obtain rootIsolateToken')));
+      return;
+    }
+    await Isolate.spawn(doTask, (rootIsolateToken, receivePort.sendPort),
         onError: errorPort.sendPort);
     final messagesFromIsolate = StreamQueue<dynamic>(receivePort);
-    final sendPort = await messagesFromIsolate.next;
-    sendPort.send([task, filePath, tempFilePath, requiredStartByte, isResume]);
+    final sendPort = await messagesFromIsolate.next as SendPort;
+    sendPort.send((
+      task,
+      filePath,
+      tempFilePath,
+      requiredStartByte,
+      isResume,
+      requestTimeout,
+      proxy,
+      bypassTLSCertificateValidation
+    ));
     if (_isolateSendPorts.keys.contains(task)) {
       // if already registered with null value, cancel immediately
       sendPort.send('cancel');
@@ -108,9 +129,15 @@ final class DesktopDownloader extends BaseDownloader {
         case 'done':
           receivePort.close();
 
-        case ('progressUpdate', double progress, int expectedFileSize):
-          processProgressUpdate(
-              TaskProgressUpdate(task, progress, expectedFileSize));
+        case (
+            'progressUpdate',
+            double progress,
+            int expectedFileSize,
+            double downloadSpeed,
+            Duration timeRemaining
+          ):
+          processProgressUpdate(TaskProgressUpdate(
+              task, progress, expectedFileSize, downloadSpeed, timeRemaining));
 
         case ('taskCanResume', bool taskCanResume):
           setCanResume(task, taskCanResume);
@@ -118,12 +145,17 @@ final class DesktopDownloader extends BaseDownloader {
         case String:
           _log.finest(message);
 
-        case ('statusUpdate', TaskStatus status, TaskException? exception):
+        case (
+            'statusUpdate',
+            TaskStatus status,
+            TaskException? exception,
+            String? responseBody
+          ):
           if (status.isFinalState) {
             _remove(task);
           }
-          processStatusUpdate(TaskStatusUpdate(
-              task, status, status == TaskStatus.failed ? exception : null));
+          processStatusUpdate(TaskStatusUpdate(task, status,
+              status == TaskStatus.failed ? exception : null, responseBody));
 
         case ('resumeData', String data, int requiredStartByte):
           setResumeData(ResumeData(task, data, requiredStartByte));
@@ -241,9 +273,46 @@ final class DesktopDownloader extends BaseDownloader {
   @override
   Future<String?> moveToSharedStorage(String filePath,
       SharedStorage destination, String directory, String? mimeType) async {
+    final destDirectoryPath =
+        await getDestinationDirectoryPath(destination, directory);
+    if (destDirectoryPath == null) {
+      return null;
+    }
+    if (!await Directory(destDirectoryPath).exists()) {
+      await Directory(destDirectoryPath).create(recursive: true);
+    }
+    final fileName = path.basename(filePath);
+    final destFilePath = path.join(destDirectoryPath, fileName);
+    try {
+      await File(filePath).rename(destFilePath);
+    } on FileSystemException catch (e) {
+      _log.warning('Error moving $filePath to shared storage: $e');
+      return null;
+    }
+    return destFilePath;
+  }
+
+  @override
+  Future<String?> pathInSharedStorage(
+      String filePath, SharedStorage destination, String directory) async {
+    final destDirectoryPath =
+        await getDestinationDirectoryPath(destination, directory);
+    if (destDirectoryPath == null) {
+      return null;
+    }
+    final fileName = path.basename(filePath);
+    return path.join(destDirectoryPath, fileName);
+  }
+
+  /// Returns the path of the destination directory in shared storage, or null
+  ///
+  /// Only the .Downloads directory is supported on desktop.
+  /// The [directory] is appended to the base Downloads directory.
+  /// The directory at the returned path is not guaranteed to exist.
+  Future<String?> getDestinationDirectoryPath(
+      SharedStorage destination, String directory) async {
     if (destination != SharedStorage.downloads) {
-      _log.finer(
-          'moveToSharedStorage on desktop only supports .downloads destination');
+      _log.finer('Desktop only supports .downloads destination');
       return null;
     }
     final downloadsDirectory = await getDownloadsDirectory();
@@ -254,21 +323,9 @@ final class DesktopDownloader extends BaseDownloader {
     // remove leading and trailing slashes from [directory]
     var cleanDirectory = directory.replaceAll(RegExp(r'^/+'), '');
     cleanDirectory = cleanDirectory.replaceAll(RegExp(r'/$'), '');
-    final destDirectory = cleanDirectory.isEmpty
+    return cleanDirectory.isEmpty
         ? downloadsDirectory.path
         : path.join(downloadsDirectory.path, cleanDirectory);
-    if (!await Directory(destDirectory).exists()) {
-      await Directory(destDirectory).create(recursive: true);
-    }
-    final fileName = path.basename(filePath);
-    final destFilePath = path.join(destDirectory, fileName);
-    try {
-      await File(filePath).rename(destFilePath);
-    } on FileSystemException catch (e) {
-      _log.warning('Error moving $filePath to shared storage: $e');
-      return null;
-    }
-    return destFilePath;
   }
 
   @override
@@ -289,6 +346,104 @@ final class DesktopDownloader extends BaseDownloader {
           'openFile command $executable returned exit code ${result.exitCode}');
     }
     return result.exitCode == 0;
+  }
+
+  @override
+  dynamic platformConfig(
+          {dynamic globalConfig,
+          dynamic androidConfig,
+          dynamic iOSConfig,
+          dynamic desktopConfig}) =>
+      desktopConfig;
+
+  @override
+  Future<(String, String)> configureItem((String, dynamic) configItem) async {
+    switch (configItem) {
+      case ('requestTimeout', Duration? duration):
+        requestTimeout = duration;
+
+      case ('proxy', (String address, int port)):
+        proxy = {'address': address, 'port': port};
+
+      case ("proxy", false):
+        proxy = {};
+
+      case ('bypassTLSCertificateValidation', bool bypass):
+        bypassTLSCertificateValidation = bypass;
+
+      default:
+        return (
+          configItem.$1,
+          'not implemented'
+        ); // this method did not process this configItem
+    }
+    return (configItem.$1, ''); // normal result
+  }
+
+  /// Sets requestTimeout and recreates HttpClient
+  static set requestTimeout(Duration? value) {
+    _requestTimeout = value;
+    _recreateClient();
+  }
+
+  static Duration? get requestTimeout => _requestTimeout;
+
+  /// Sets proxy and recreates HttpClient
+  ///
+  /// Value must be dict containing 'address' and 'port'
+  /// or empty for no proxy
+  static set proxy(Map<String, dynamic> value) {
+    _proxy = value;
+    _recreateClient();
+  }
+
+  static Map<String, dynamic> get proxy => _proxy;
+
+  /// Set or resets bypass for TLS certificate validation
+  static set bypassTLSCertificateValidation(bool value) {
+    _bypassTLSCertificateValidation = value;
+    _recreateClient();
+  }
+
+  static bool get bypassTLSCertificateValidation =>
+      _bypassTLSCertificateValidation;
+
+  /// Set the HTTP Client to use, with the given parameters
+  ///
+  /// This is a convenience method, bundling the [requestTimeout],
+  /// [proxy] and [bypassTLSCertificateValidation]
+  static void setHttpClient(Duration? requestTimeout,
+      Map<String, dynamic> proxy, bool bypassTLSCertificateValidation) {
+    _requestTimeout = requestTimeout;
+    _proxy = proxy;
+    _bypassTLSCertificateValidation = bypassTLSCertificateValidation;
+    _recreateClient();
+  }
+
+  /// Recreates the [httpClient] used for Requests and isolate downloads/uploads
+  static _recreateClient() {
+    final client = HttpClient();
+    client.connectionTimeout = requestTimeout;
+    client.findProxy = proxy.isNotEmpty
+        ? (_) => 'PROXY ${_proxy['address']}:${_proxy['port']}'
+        : null;
+    client.badCertificateCallback =
+        bypassTLSCertificateValidation && !kReleaseMode
+            ? (X509Certificate cert, String host, int port) => true
+            : null;
+    httpClient = IOClient(client);
+    if (bypassTLSCertificateValidation) {
+      if (kReleaseMode) {
+        throw ArgumentError(
+            'You cannot bypass certificate validation in release mode');
+      } else {
+        _log.warning(
+            'TLS certificate validation is bypassed. This is insecure and cannot be '
+            'done in release mode');
+      }
+    }
+    _log.finest(
+        'Using HTTP client with requestTimeout $_requestTimeout, proxy $_proxy and TLSCertificateBypass = $bypassTLSCertificateValidation');
   }
 
   @override

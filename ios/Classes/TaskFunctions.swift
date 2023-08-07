@@ -21,14 +21,21 @@ func providesStatusUpdates(downloadTask: Task) -> Bool {
     return downloadTask.updates == Updates.statusChange.rawValue || downloadTask.updates == Updates.statusChangeAndProgressUpdates.rawValue
 }
 
-/// True if this task is a DownloadTask, false if it is an UploadTask
+/// True if this task is a DownloadTask, false if not
 func isDownloadTask(task: Task) -> Bool {
-    return task.taskType != "UploadTask"
+    return task.taskType == "DownloadTask"
 }
 
-/// True if this task is an UploadTask, false if it is an UploadTask
+/// True if this task is an UploadTask, false if not
+///
+/// A MultiUploadTask is also an UploadTask
 func isUploadTask(task: Task) -> Bool {
-    return task.taskType == "UploadTask"
+    return task.taskType == "UploadTask" || task.taskType == "MultiUploadTask"
+}
+
+/// True if this task is a MultiUploadTask, false if not
+func isMultiUploadTask(task: Task) -> Bool {
+    return task.taskType == "MultiUploadTask"
 }
 
 /// True if this task is a binary UploadTask
@@ -46,21 +53,63 @@ func isFinalState(status: TaskStatus) -> Bool {
     return !isNotFinalState(status: status)
 }
 
-/// Returns the filePath associated with this task, or nil
-func getFilePath(for task: Task) -> String? {
+/// Returns the absolute path to the file represented by this task
+/// based on the [Task.filename] (default) or [withFilename]
+///
+/// If the task is a MultiUploadTask and no [withFilename] is given,
+/// returns the empty string, as there is no single path that can be
+/// returned
+func getFilePath(for task: Task, withFilename: String? = nil) -> String? {
+    if isMultiUploadTask(task: task) && withFilename == nil {
+        return ""
+    }
     guard let directory = try? directoryForTask(task: task)
     else {
         return nil
     }
-    return directory.appendingPathComponent(task.filename).path
+    return directory.appendingPathComponent(withFilename ?? task.filename).path
 }
+
+/// Returns a list of fileData elements, one for each file to upload.
+/// Each element is a triple containing fileField, full filePath, mimeType
+///
+/// The lists are stored in the similarly named String fields as a JSON list,
+/// with each list the same length. For the filenames list, if a filename refers
+/// to a file that exists (i.e. it is a full path) then that is the filePath used,
+/// otherwise the filename is appended to the [Task.baseDirectory] and [Task.directory]
+/// to form a full file path
+func extractFilesData(task: Task) -> [((String, String, String))] {
+    let decoder = JSONDecoder()
+    guard
+        let fileFields = try? decoder.decode([String].self, from: task.fileField!.data(using: .utf8)!),
+        let filenames = try? decoder.decode([String].self, from: task.filename.data(using: .utf8)!),
+        let mimeTypes = try? decoder.decode([String].self, from: task.mimeType!.data(using: .utf8)!)
+    else {
+        os_log("Could not parse filesData from field=%@, filename=%@ and mimeType=%@", log: log, type: .error, task.fileField!, task.filename, task.mimeType!)
+        return []
+    }
+    var result = [(String, String, String)]()
+    for i in 0 ..< fileFields.count {
+        if FileManager.default.fileExists(atPath: filenames[i]) {
+            result.append((fileFields[i], filenames[i], mimeTypes[i]))
+        } else {
+            result.append((
+                fileFields[i],
+                getFilePath(for: task, withFilename: filenames[i]) ?? "",
+                mimeTypes[i]
+            ))
+        }
+    }
+    return result
+}
+
 
 /// Processes a change in status for the task
 ///
 /// Sends status update via the background channel to Dart, if requested
 /// If the task is finished, processes a final progressUpdate update and removes
 /// task from persistent storage
-func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskException? = nil) {
+func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskException? = nil, responseBody: String? = nil) {
     // Post update if task expects one, or if failed and retry is needed
     let retryNeeded = status == TaskStatus.failed && task.retriesRemaining > 0
     // if task is in final state, process a final progressUpdate
@@ -83,11 +132,14 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
     default:
         break
     }
-
+    
     if providesStatusUpdates(downloadTask: task) || retryNeeded {
-        let finalTaskException = taskException == nil ? TaskException(type: .general,
-                                                           httpResponseCode: -1, description: "") : taskException
-        let arg: Any = status == .failed ? [status.rawValue, finalTaskException!.type.rawValue, finalTaskException!.description, finalTaskException!.httpResponseCode] : status.rawValue
+        let finalTaskException = taskException == nil
+            ? TaskException(type: .general, httpResponseCode: -1, description: "")
+            : taskException
+        let arg: [Any?] = status == .failed
+            ? [status.rawValue, finalTaskException!.type.rawValue, finalTaskException!.description, finalTaskException!.httpResponseCode, responseBody] as [Any?]
+            : [status.rawValue, responseBody] as [Any?]
         if !postOnBackgroundChannel(method: "statusUpdate", task: task, arg: arg) {
             // store update locally as a merged task/status JSON string, without error info
             guard let jsonData = try? JSONEncoder().encode(task),
@@ -100,10 +152,10 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
         }
     }
     if isFinalState(status: status) {
-        // remove from persistent storage
-        Downloader.lastProgressUpdate.removeValue(forKey: task.taskId)
-        Downloader.nextProgressUpdateTime.removeValue(forKey: task.taskId)
+        // remove references to this task that are no longer needed
+        Downloader.progressInfo.removeValue(forKey: task.taskId)
         Downloader.localResumeData.removeValue(forKey: task.taskId)
+        Downloader.remainingBytesToDownload.removeValue(forKey: task.taskId)
     }
 }
 
@@ -111,9 +163,9 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
 /// Processes a progress update for the task
 ///
 /// Sends progress update via the background channel to Dart, if requested
-func processProgressUpdate(task: Task, progress: Double, expectedFileSize: Int64 = -1) {
+func processProgressUpdate(task: Task, progress: Double, expectedFileSize: Int64 = -1, networkSpeed: Double = -1.0, timeRemaining: TimeInterval = -1.0) {
     if providesProgressUpdates(task: task) {
-        if (!postOnBackgroundChannel(method: "progressUpdate", task: task, arg: [progress, expectedFileSize])) {
+        if (!postOnBackgroundChannel(method: "progressUpdate", task: task, arg: [progress, expectedFileSize, networkSpeed, Int(timeRemaining * 1000.0)] as [Any])) {
             // store update locally as a merged task/progress JSON string
             guard let jsonData = try? JSONEncoder().encode(task),
                   var jsonObject = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
@@ -143,7 +195,7 @@ func processCanResume(task: Task, taskCanResume: Bool) {
 func processResumeData(task: Task, resumeData: Data) -> Bool {
     let resumeDataAsBase64String = resumeData.base64EncodedString()
     Downloader.localResumeData[task.taskId] = resumeDataAsBase64String
-    if !postOnBackgroundChannel(method: "resumeData", task: task, arg: [resumeDataAsBase64String, 0 as Int64]) {
+    if !postOnBackgroundChannel(method: "resumeData", task: task, arg: [resumeDataAsBase64String, 0 as Int64] as [Any]) {
         // store resume data locally
         guard let jsonData = try? JSONEncoder().encode(task),
               var taskJsonObject = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
@@ -181,9 +233,9 @@ func postOnBackgroundChannel(method: String, task:Task, arg: Any) -> Bool {
         os_log("Could not convert task to JSON", log: log, type: .error)
         return false
     }
-    var argsList: [Any] = [jsonString]
-    if arg is [Any] {
-        argsList.append(contentsOf: arg as! [Any])
+    var argsList: [Any?] = [jsonString]
+    if arg is [Any?] {
+        argsList.append(contentsOf: arg as! [Any?])
     } else {
         argsList.append(arg)
     }
@@ -305,4 +357,32 @@ func directoryForTask(task: Task) throws ->  URL {
     return task.directory.isEmpty
     ? documentsURL
     : documentsURL.appendingPathComponent(task.directory)
+}
+
+/**
+ * Returns true if there is insufficient space to store a file of length
+ * [contentLength]
+ *
+ * Returns false if [contentLength] <= 0
+ * Returns false if configCheckAvailableSpace has not been set, or if available
+ * space is greater than that setting
+ * Returns true otherwise
+ */
+func insufficientSpace(contentLength: Int64) -> Bool {
+    guard contentLength > 0 else {
+        return false
+    }
+    let checkValue = UserDefaults.standard.integer(forKey: Downloader.keyConfigCheckAvailableSpace)
+    guard
+        // Check if the configCheckAvailableSpace preference is set and is positive
+        checkValue > 0,
+        let path = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first,
+        let available = try? URL(fileURLWithPath: path).resourceValues(forKeys: [URLResourceKey.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
+    else {
+        return false
+    }
+    // Calculate the total remaining bytes to download
+    let remainingBytesToDownload = Downloader.remainingBytesToDownload.values.reduce(0, +)
+    // Return true if there is insufficient space to store the file
+    return available - (remainingBytesToDownload + contentLength) < checkValue << 20
 }

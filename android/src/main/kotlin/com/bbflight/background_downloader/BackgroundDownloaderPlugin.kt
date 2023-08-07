@@ -56,6 +56,12 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
         const val keyResumeDataMap = "com.bbflight.background_downloader.resumeDataMap"
         const val keyStatusUpdateMap = "com.bbflight.background_downloader.statusUpdateMap"
         const val keyProgressUpdateMap = "com.bbflight.background_downloader.progressUpdateMap"
+        const val keyConfigForegroundFileSize =
+            "com.bbflight.background_downloader.config.foregroundFileSize"
+        const val keyConfigProxyAddress = "com.bbflight.background_downloader.config.proxyAddress"
+        const val keyConfigProxyPort = "com.bbflight.background_downloader.config.proxyPort"
+        const val keyConfigRequestTimeout = "com.bbflight.background_downloader.config.requestTimeout"
+        const val keyConfigCheckAvailableSpace = "com.bbflight.background_downloader.config.checkAvailableSpace"
         const val notificationChannel = "background_downloader"
         const val notificationPermissionRequestCode = 373921
         const val externalStoragePermissionRequestCode = 373922
@@ -73,6 +79,8 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
         var requestingNotificationPermission = false
         var externalStoragePermissionCompleter = CompletableFuture<Boolean>()
         var localResumeData = HashMap<String, ResumeData>()
+        var remainingBytesToDownload = HashMap<String, Long>()
+        var haveLoggedProxyMessage = false
 
         /**
          * Enqueue a WorkManager task based on the provided parameters
@@ -214,16 +222,15 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
          * Marks the task for pausing, actual pausing happens in [TaskWorker]
          */
         fun pauseTaskWithId(taskId: String): Boolean {
-            Log.v(TAG, "Marking taskId $taskId for pausing")
             pausedTaskIds.add(taskId)
             return true
         }
     }
 
     private var channel: MethodChannel? = null
-    lateinit var applicationContext: Context
-    var pauseReceiver: NotificationRcvr? = null
-    var resumeReceiver: NotificationRcvr? = null
+    private lateinit var applicationContext: Context
+    private var pauseReceiver: NotificationRcvr? = null
+    private var resumeReceiver: NotificationRcvr? = null
     private var scope: CoroutineScope? = null
 
     /**
@@ -290,6 +297,7 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
                 "reset" -> methodReset(call, result)
                 "allTasks" -> methodAllTasks(call, result)
                 "cancelTasksWithIds" -> methodCancelTasksWithIds(call, result)
+                "killTaskWithId" -> methodKillTaskWithId(call, result)
                 "taskForId" -> methodTaskForId(call, result)
                 "pause" -> methodPause(call, result)
                 "popResumeData" -> methodPopResumeData(result)
@@ -297,7 +305,14 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
                 "popProgressUpdates" -> methodPopProgressUpdates(result)
                 "getTaskTimeout" -> methodGetTaskTimeout(result)
                 "moveToSharedStorage" -> methodMoveToSharedStorage(call, result)
+                "pathInSharedStorage" -> methodPathInSharedStorage(call, result)
                 "openFile" -> methodOpenFile(call, result)
+                "configForegroundFileSize" -> methodConfigForegroundFileSize(call, result)
+                "configProxyAddress" -> methodConfigProxyAddress(call, result)
+                "configProxyPort" -> methodConfigProxyPort(call, result)
+                "configRequestTimeout" -> methodConfigRequestTimeout(call, result)
+                "configBypassTLSCertificateValidation" -> methodConfigBypassTLSCertificateValidation(result)
+                "configCheckAvailableSpace" -> methodConfigcheckAvailableSpace(call, result)
                 "forceFailPostOnBackgroundChannel" -> methodForceFailPostOnBackgroundChannel(
                     call, result
                 )
@@ -404,6 +419,32 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
         result.success(success)
     }
 
+    /**
+     * Kills task with taskId provided as argument in call
+     *
+     * Killing differs from canceling in that it only removes the task from the WorkManager
+     * schedule, without emitting any status updates. It is used to prevent the WorkManager from
+     * rescheduling WorkManager tasks that are canceled because a constraint is no longer met, e.g.
+     * network disconnect. We want to handle such errors ourselves, using our retry mechanism,
+     * and not let the WorkManager reschedule those tasks.  The killTask method is therefore called
+     * whenever a task emits a 'failed' update, as we have no way to determine if the task failed
+     * with the worker 'SUCCESS' or with the worker 'CANCELED'
+     */
+    private fun methodKillTaskWithId(call: MethodCall, result: Result) {
+        val taskId = call.arguments as String
+        val workManager = WorkManager.getInstance(applicationContext)
+        val operation = workManager.cancelAllWorkByTag("taskId=$taskId")
+        try {
+            operation.result.get()
+        } catch (e: Throwable) {
+            Log.w(
+                TAG,
+                "Could not kill task wih id $taskId in operation: $operation"
+            )
+        }
+        result.success(null)
+    }
+
     /** Returns Task for this taskId, or nil */
     private fun methodTaskForId(call: MethodCall, result: Result) {
         val taskId = call.arguments as String
@@ -445,7 +486,7 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
     }
 
     /**
-     * Returns a JSON String of a map of [ResumeData], keyed by taskId, that has veen stored
+     * Returns a JSON String of a map of [ResumeData], keyed by taskId, that has been stored
      * in local shared preferences because they could not be delivered to the Dart side.
      * Local storage of this map is then cleared
      */
@@ -474,6 +515,7 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
      * - filePath (String): full path to file to be moved
      * - destination (Int as index into [SharedStorage] enum)
      * - directory (String): subdirectory within scoped storage
+     * - mimeType (String?): mimeType of the file, overrides derived mimeType
      */
     private fun methodMoveToSharedStorage(call: MethodCall, result: Result) {
         val args = call.arguments as List<*>
@@ -513,6 +555,25 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
     }
 
     /**
+     * Returns path to file in Android scoped/shared storage, or null
+     *
+     * Call arguments:
+     * - filePath (String): full path to file (only the name is used)
+     * - destination (Int as index into [SharedStorage] enum)
+     * - directory (String): subdirectory within scoped storage (ignored for Q+)
+     *
+     * For Android Q+ uses the MediaStore, matching on filename only, i.e. ignoring
+     * the directory
+     */
+    private fun methodPathInSharedStorage(call: MethodCall, result: Result) {
+        val args = call.arguments as List<*>
+        val filePath = args[0] as String
+        val destination = SharedStorage.values()[args[1] as Int]
+        val directory = args[2] as String
+        result.success(pathInSharedStorage(applicationContext, filePath, destination, directory))
+    }
+
+    /**
      * Open the file represented by the task, with optional mimeType
      *
      * Call arguments are [taskJsonMapString, filename, mimeType] with precondition that either
@@ -538,6 +599,73 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
         result.success(TaskWorker.taskTimeoutMillis)
     }
 
+
+    /**
+     * Store foregroundFileSize in shared preferences
+     *
+     * The value is in MB, or -1 to disable foreground always, and
+     * is retrieved in [TaskWorker.doWork]
+     */
+    private fun methodConfigForegroundFileSize(call: MethodCall, result: Result) {
+        val fileSize = call.arguments as Int
+        updateSharedPreferences(keyConfigForegroundFileSize, fileSize)
+        val msg = when (fileSize) {
+            0 ->  "Enabled foreground mode for all tasks"
+            -1 -> "Disabled foreground mode for all tasks"
+            else -> "Set foreground file size threshold to $fileSize MB"
+        }
+        Log.v(TAG, msg)
+        result.success(null)
+    }
+
+    /**
+     * Store the proxy address config in shared preferences
+     */
+    private fun methodConfigProxyAddress(call: MethodCall, result: Result) {
+        PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
+            val address = call.arguments as String?
+            if (address != null) {
+                putString(keyConfigProxyAddress, address)
+            } else {
+                remove(keyConfigProxyAddress)
+            }
+            apply()
+        }
+        result.success(null)
+    }
+
+    /**
+     * Store the proxy port config in shared preferences
+     */
+    private fun methodConfigProxyPort(call: MethodCall, result: Result) {
+        updateSharedPreferences(keyConfigProxyPort, call.arguments as Int?)
+        result.success(null)
+    }
+
+    /**
+     * Store the requestTimeout config in shared preferences
+     */
+    private fun methodConfigRequestTimeout(call: MethodCall, result: Result) {
+        updateSharedPreferences(keyConfigRequestTimeout, call.arguments as Int?)
+        result.success(null)
+    }
+
+    /**
+     * Bypass the certificate validation
+     */
+    private fun methodConfigBypassTLSCertificateValidation(result: Result) {
+        acceptUntrustedCertificates()
+        result.success(null)
+    }
+
+    /**
+     * Store the availableSpace config in shared preferences
+     */
+    private fun methodConfigcheckAvailableSpace(call: MethodCall, result: Result) {
+        updateSharedPreferences(keyConfigCheckAvailableSpace, call.arguments as Int?)
+        result.success(null)
+    }
+
     /**
      * Sets or resets flag to force failing posting on background channel
      *
@@ -548,12 +676,28 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
         result.success(null)
     }
 
+    /**
+     * Helper function to update or delete the [value] in shared preferences under [key]
+     *
+     * If [value] is null, the [key] is deleted
+     */
+    private fun updateSharedPreferences(key: String, value: Int?) {
+        PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
+            if (value != null) {
+                putInt(key, value)
+            } else {
+                remove(key)
+            }
+            apply()
+        }
+    }
+
     // ActivityAware implementation to capture Activity context needed for permissions and intents
 
     /**
      * Handle intent if received from tapping a notification
      *
-     * This may be called on statup of the application and at that time the [backgroundChannel] and
+     * This may be called on startup of the application and at that time the [backgroundChannel] and
      * its listener may not have been initialized yet. This function therefore includes retry logic.
      */
     private fun handleIntent(intent: Intent?): Boolean {
@@ -562,21 +706,27 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
                 intent.extras?.getString(NotificationRcvr.bundleTask)
             val notificationTypeOrdinal =
                 intent.getIntExtra(NotificationRcvr.bundleNotificationType, 0)
-            scope?.launch {
+            CoroutineScope(Dispatchers.Default).launch {
                 var retries = 0
                 var success = false
                 while (retries < 5 && !success) {
                     try {
-                        if (backgroundChannel != null) {
-                            backgroundChannel?.invokeMethod(
-                                "notificationTap",
-                                listOf(taskJsonMapString, notificationTypeOrdinal)
-                            )
-                            success = true
+                        if (backgroundChannel != null && scope != null) {
+                            val resultCompleter = CompletableFuture<Boolean>()
+                            val resultHandler = ResultHandler(resultCompleter)
+                            scope?.launch {
+                                backgroundChannel?.invokeMethod(
+                                    "notificationTap",
+                                    listOf(taskJsonMapString, notificationTypeOrdinal),
+                                    resultHandler
+                                )
+                            }
+                            success = resultCompleter.join()
                         }
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        Log.v(TAG, "Exception in handleIntent: $e")
                     }
-                    if (retries < 4 && !success) {
+                    if (!success) {
                         delay(timeMillis = 100 * 2.0.pow(retries).toLong())
                         retries++
                     }
@@ -602,25 +752,40 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        attach(binding)
+        handleIntent(binding.activity.intent)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        detach()
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        attach(binding)
+    }
+
+    override fun onDetachedFromActivity() {
+        detach()
+    }
+
+
+    /**
+     * Attach to activity
+     */
+    private fun attach(binding: ActivityPluginBinding) {
+        detach()
         activity = binding.activity
         scope = MainScope()
         binding.addRequestPermissionsResultListener(this)
         binding.addOnNewIntentListener(fun(intent: Intent?): Boolean {
             return handleIntent(intent)
         })
-        handleIntent(binding.activity.intent)
     }
 
-    override fun onDetachedFromActivityForConfigChanges() {
-        activity = null
-    }
-
-    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
-        activity = binding.activity
-        binding.addRequestPermissionsResultListener(this)
-    }
-
-    override fun onDetachedFromActivity() {
+    /**
+     * Detach from activity
+     */
+    private fun detach() {
         activity = null
         scope?.cancel()
         scope = null
@@ -647,4 +812,26 @@ class BackgroundDownloaderPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
             }
         }
     }
+}
+
+/**
+ * Simple Flutter result handler, completes the [completer] with the result
+ * of the MethodChannel call
+ */
+class ResultHandler(private val completer: CompletableFuture<Boolean>) : Result {
+
+    override fun success(result: Any?) {
+        completer.complete(result == true)
+    }
+
+    override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+        Log.i(BackgroundDownloaderPlugin.TAG, "Flutter result error $errorCode: $errorMessage")
+        completer.complete(false)
+    }
+
+    override fun notImplemented() {
+        Log.i(BackgroundDownloaderPlugin.TAG, "Flutter method not implemented")
+        completer.complete(false)
+    }
+
 }

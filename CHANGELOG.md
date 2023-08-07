@@ -1,3 +1,109 @@
+## 7.9.0
+
+### Configuration
+
+Add configuration of the downloader for several aspect:
+* Running tasks in 'foreground mode' on Android to allow longer runs and prevent the OS killing some tasks when the app is in the background
+* Setting the request timeout value and, for iOS only, the 'resourceTimeout'
+* Checking available space before attempting a download
+* Setting a proxy
+* Localizing the notification button texts on iOS
+* Bypassing TLS Certificate validation (for debug mode only)
+
+Please read the [configuration document](https://github.com/781flyingdutchman/background_downloader/blob/main/CONFIG.md) for details on how to configure.
+
+Configuration is experimental, so please test thoroughly before using in production, and let me know if there are any issues.
+
+### Network speed and time remaining in `TaskStatusUpdate`
+`TaskStatusUpdate` now has fields `networkSpeed` (in MB/s) and `timeRemaining`. Check the associated `hasNetworkSpeed` and `hasTimeRemaining` before using the values in these fields.  Use `networkSpeedAsString` and `timeRemainingAsString` for human readable versions of these values.
+
+### Filter `TaskRecord` entries by status: `allRecordsWithStatus`
+The `database` now has method `allRecordsWithStatus` to filter records based on their `TaskStatus`
+
+## 7.8.1
+
+Bug fix for `taskNotificationTapCallback`: convenience methods that `await` a result, such as `download` (but not `enqueue`), now use the default `taskNotificationTapCallback`, even though those tasks are in the `awaitGroup`, because that behavior is more in line with expectations. If you need a separate callback for the `awaitGroup`, then set it _after_ setting the default callback. You set the default callback by omitting the `group` parameter in the `registerCallbacks` call.
+
+## 7.8.0
+
+Added field `responseBody` to `TaskStatusUpdate` that, if not null, contains the server response for uploads, and for downloads that are not complete (e.g. `.notFound`). In those instances, the server response may contain useful information (e.g. a url where the uploaded file can be found, or the reason for the 'not found' status as provided by the server)
+
+Improved handling of notification tap callbacks.
+
+## 7.7.1
+
+Bug fix for Flutter Downloader migration on iOS, issue #86
+
+## 7.7.0 
+
+### Uploading multiple files in a single request
+If you need to upload multiple files in a single request, create a [MultiUploadTask](https://pub.dev/documentation/background_downloader/latest/background_downloader/MultiUploadTask-class.html) instead of an `UploadTask`. It has similar parameters as the `UploadTask`, except you specifiy a list of files to upload as the `files` argument of the constructor, and do not use `fileName`, `fileField` and `mimeType`. Each element in the `files` list is either:
+* a filename (e.g. `"file1.txt"`). The `fileField` for that file will be set to the base name (i.e. "file1" for "file1.txt") and the mime type will be derived from the extension (i.e. "text/plain" for "file1.txt")
+* a record containing `(fileField, filename)`, e.g. `("document", "file1.txt")`. The `fileField` for that file will be set to "document" and the mime type derived from the file extension (i.e. "text/plain" for "file1.txt")
+* a record containing `(filefield, filename, mimeType)`, e.g. `("document", "file1.txt", "text/plain")`
+
+The `baseDirectory` and `directory` fields of the `MultiUploadTask` determine the expected location of the file referenced, unless the filename used in any of the 3 formats above is an absolute path (e.g. "/data/user/0/com.my_app/file1.txt"). In that case, the absolute path is used and the `baseDirectory` and `directory` fields are ignored for that element of the list.
+Once the `MultiUpoadTask` is created, the fields `fileFields`, `filenames` and `mimeTypes` will contain the parsed items, and the fields `fileField`, `filename` and `mimeType` contain those lists encoded as a JSON string.
+
+Use the `MultiTaskUpload` object in the `upload` and `enqueue` methods as you would a regular `UploadTask`.
+
+### Flutter Downloader migration
+Bug fixes related to migration from Flutter Downloader (see version 7.6.0). The migration is still experimental, so please test thoroughly before relying on the migration in your app.
+
+### Bug fixes
+
+Fixed a bug on iOS related to NSNull Json decoding
+
+## 7.6.0
+
+Added `SqlitePersistentStorage` as an alternative backing storage for the downloader, and implemented migration of a pre-existing database from the Flutter Downloader package. We use the `sqflite` package, so this is only supported iOS and Android.
+
+To use the downloader with SQLite backing and migration from Flutter Downloader, initialize the `FileDownloader` at the very beginning of your app:
+```dart
+final sqlStorage = SqlitePersistentStorage(migrationOptions: ['flutter_downloader', 'local_store']);
+FileDownloader(persistentStorage: sqlStorage);
+// start using the FileDownloader
+```
+
+This will migrate from either Flutter Downloader or the default LocalStore.
+
+Added an optional parameter to the tasksFinished method that allows you to use it the moment you receive a status update for a task, like this:
+```dart
+void downloadStatusCallback(TaskStatusUpdate update) {
+    // process your status update, then check if all tasks are finished
+    final bool allTasksFinished = update.status.isFinalState && 
+        await FileDownloader().tasksFinished(ignoreTaskId: update.task.taskId) ;
+    print('All tasks finished: $allTasksFinished');
+  }
+```
+This excludes the task that is currently finishing up from the test. Without this, it's possible `tasksFinished` returns `false` as that currently finishing task may not have left the queue yet.
+
+## 7.5.0
+
+Added `pathInSharedStorage` method, which obtains the path to a file moved to shared storage.
+
+To check if a file exists in shared storage, obtain the path to the file by calling
+`pathInSharedStorage` and, if not null, check if that file exists.
+
+__On Android 29+:__ If you
+have generated a version with an indexed name (e.g. 'myFile (1).txt'), then only the most recently stored version is available this way, even if an earlier version actually does exist. Also, only files stored by your app will be returned via this call, as you don't have access to files stored by other apps.
+
+__On iOS:__ To make files visible in the Files browser, do not move them to shared storage. Instead, download the file to the `BaseDirectory.applicationDocuments` and add the following to your `Info.plist`:
+```
+<key>LSSupportsOpeningDocumentsInPlace</key>
+<true/>
+<key>UIFileSharingEnabled</key>
+<true/>
+```
+This will make all files in your app's `Documents` directory visible to the Files browser.
+
+Bug fixes:
+* Fixed bug when download is interrupted due to lost network connection (on Android)
+* Fixed bug with `moveToSharedStorage` on iOS: shared storage is now 'faked' on iOS, creating 
+subdirectories of the regular Documents directory, as iOS apps do not have access to shared 
+media and download directories
+* Fixed bug with notifications disappearing on iOS
+
 ## 7.4.1
 
 Bug fix for type cast errors and for thread safety on iOS for notifications
@@ -61,6 +167,53 @@ Further Dart 3 changes (not visible to user).
 Migration to Dart 3 - not other functional change or API change.  If you use Dart 2 please use version `6.1.1` of this plugin, which will be maintained until the end of 2023.
 
 Most classes in the package are now `final` classes, and under the hood we use the new Records and Pattern matching features of Dart 3. None of this should matter if you've used the package as intended.
+
+## 6.3.2
+
+Fixed a bug on iOS related to NSNull Json decoding
+
+## 6.3.1
+
+Added an optional parameter to the tasksFinished method that allows you to use it the moment you receive a status update for a task, like this:
+```dart
+void downloadStatusCallback(TaskStatusUpdate update) {
+    // process your status update, then check if all tasks are finished
+    final bool allTasksFinished = update.status.isFinalState && 
+        await FileDownloader().tasksFinished(ignoreTaskId: update.task.taskId) ;
+    print('All tasks finished: $allTasksFinished');
+  }
+```
+This excludes the task that is currently finishing up from the test. Without this, it's possible `tasksFinished` returns `false` as that currently finishing task may not have left the queue yet.
+
+## 6.3.0
+
+Added `pathInSharedStorage` method, which obtains the path to a file moved to shared storage.
+
+To check if a file exists in shared storage, obtain the path to the file by calling
+`pathInSharedStorage` and, if not null, check if that file exists.
+
+__On Android 29+:__ If you
+have generated a version with an indexed name (e.g. 'myFile (1).txt'), then only the most recently stored version is available this way, even if an earlier version actually does exist. Also, only files stored by your app will be returned via this call, as you don't have access to files stored by other apps.
+
+__On iOS:__ To make files visible in the Files browser, do not move them to shared storage. Instead, download the file to the `BaseDirectory.applicationDocuments` and add the following to your `Info.plist`:
+```
+<key>LSSupportsOpeningDocumentsInPlace</key>
+<true/>
+<key>UIFileSharingEnabled</key>
+<true/>
+```
+This will make all files in your app's `Documents` directory visible to the Files browser.
+
+Bug fixes:
+* Fixed bug when download is interrupted due to lost network connection (on Android)
+* Fixed bug with `moveToSharedStorage` on iOS: shared storage is now 'faked' on iOS, creating
+  subdirectories of the regular Documents directory, as iOS apps do not have access to shared
+  media and download directories
+* Fixed bug with notifications disappearing on iOS
+
+## 6.2.1
+
+Bug fix for type cast errors and for thread safety on iOS for notifications
 
 ## 6.2.0
 

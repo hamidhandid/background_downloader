@@ -10,6 +10,7 @@ import android.util.Log
 import android.webkit.MimeTypeMap
 import androidx.annotation.RequiresApi
 import androidx.loader.content.CursorLoader
+import com.bbflight.background_downloader.BackgroundDownloaderPlugin.Companion.TAG
 import java.io.File
 import java.io.FileInputStream
 import java.io.OutputStream
@@ -45,8 +46,8 @@ fun moveToSharedStorage(
         )
         return null
     }
-    var cleanDirectory = leadingPathSeparatorRegEx.replace(directory, "")
-    cleanDirectory = trailingPathSeparatorRegEx.replace(cleanDirectory, "")
+    val cleanDirectory =
+        trailingPathSeparatorRegEx.replace(leadingPathSeparatorRegEx.replace(directory, ""), "")
     // Set up the content values for the new file
     val contentValues = ContentValues().apply {
         put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
@@ -77,7 +78,8 @@ fun moveToSharedStorage(
             }
         } catch (e: Exception) {
             Log.i(
-                BackgroundDownloaderPlugin.TAG, "Error moving file $filePath to shared storage: $e"
+                BackgroundDownloaderPlugin.TAG,
+                "Error moving file $filePath to shared storage: $e"
             )
         } finally {
             contentValues.clear()
@@ -143,10 +145,46 @@ private fun moveToPublicDirectory(
         return destinationFile.absolutePath
     } catch (e: Exception) {
         Log.i(
-            BackgroundDownloaderPlugin.TAG, "Unable to move file $filePath to public directory: $e"
+            BackgroundDownloaderPlugin.TAG,
+            "Unable to move file $filePath to public directory: $e"
         )
         return null
     }
+}
+
+/**
+ * Returns the path to the file in shared storage, or null
+ */
+fun pathInSharedStorage(
+    context: Context,
+    filePath: String,
+    destination: SharedStorage,
+    directory: String
+): String? {
+    val fileName = File(filePath).name
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        val destinationMediaPath = getMediaStorePathBelowQ(destination)
+        val rootDir = Environment.getExternalStoragePublicDirectory(destinationMediaPath)
+        val destDir = File(rootDir, directory)
+        val destinationFile = File(destDir, fileName)
+        return destinationFile.path
+    }
+    // Version above Q uses MediaStore
+    context.contentResolver.query(
+        getMediaStoreUri(destination),
+        arrayOf(
+            MediaStore.Images.Media.DATA,
+            MediaStore.MediaColumns.DISPLAY_NAME
+        ), // same for all collections AFAIK
+        "${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+        arrayOf(fileName),
+        null
+    )?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            return cursor.getString(0)
+        }
+    }
+    return null
 }
 
 /**
@@ -156,10 +194,22 @@ private fun moveToPublicDirectory(
 private fun getMediaStoreUri(destination: SharedStorage): Uri {
     return when (destination) {
         SharedStorage.files -> MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        SharedStorage.downloads -> MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        SharedStorage.images -> MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        SharedStorage.video -> MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        SharedStorage.audio -> MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        SharedStorage.downloads -> MediaStore.Downloads.getContentUri(
+            MediaStore.VOLUME_EXTERNAL_PRIMARY
+        )
+
+        SharedStorage.images -> MediaStore.Images.Media.getContentUri(
+            MediaStore.VOLUME_EXTERNAL_PRIMARY
+        )
+
+        SharedStorage.video -> MediaStore.Video.Media.getContentUri(
+            MediaStore.VOLUME_EXTERNAL_PRIMARY
+        )
+
+        SharedStorage.audio -> MediaStore.Audio.Media.getContentUri(
+            MediaStore.VOLUME_EXTERNAL_PRIMARY
+        )
+
         SharedStorage.external -> MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
     }
 }
@@ -192,6 +242,7 @@ private fun getRelativePath(destination: SharedStorage, directory: String): Stri
     }
     return if (directory.isEmpty()) sharedStorageDirectory else "$sharedStorageDirectory/$directory"
 }
+
 
 /**
  * Return Mime type for this [fileName], as a String

@@ -9,7 +9,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Context.NOTIFICATION_SERVICE
-
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -23,29 +22,33 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.preference.PreferenceManager
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import com.google.gson.Gson
 import kotlinx.coroutines.*
 import java.io.*
-import java.lang.Double.min
 import java.lang.System.currentTimeMillis
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.SocketException
 import java.net.URL
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.util.*
-import kotlin.collections.ArrayList
 import kotlin.concurrent.schedule
 import kotlin.concurrent.write
 import kotlin.math.roundToInt
 import kotlin.random.Random
+import java.lang.Double.min as doubleMin
 
 
 /***
- * A simple worker that will post your input back to your Flutter application.
+ * The worker to execute one task
  *
- * It will block the background thread until a value of either true or false is received back from Flutter code.
+ * Processes DownloadTask, UploadTask or MultiUploadTask
  */
 class TaskWorker(
     applicationContext: Context, workerParams: WorkerParameters
@@ -63,17 +66,16 @@ class TaskWorker(
 
         private val fileNameRegEx = Regex("""\{filename\}""", RegexOption.IGNORE_CASE)
         private val progressRegEx = Regex("""\{progress\}""", RegexOption.IGNORE_CASE)
+        private val networkSpeedRegEx = Regex("""\{networkSpeed\}""", RegexOption.IGNORE_CASE)
+        private val timeRemainingRegEx = Regex("""\{timeRemaining\}""", RegexOption.IGNORE_CASE)
         private val metaDataRegEx = Regex("""\{metadata\}""", RegexOption.IGNORE_CASE)
-        private val asciiOnly = Regex("^[\\x00-\\x7F]+$")
-        private val newlineRegExp = Regex("\r\n|\r|\n")
+        private val asciiOnlyRegEx = Regex("^[\\x00-\\x7F]+$")
+        private val newlineRegEx = Regex("\r\n|\r|\n")
 
         const val boundary = "-----background_downloader-akjhfw281onqciyhnIk"
         const val lineFeed = "\r\n"
 
-        private var taskCanResume = false
         private var createdNotificationChannel = false
-
-        private var taskException: TaskException? = null
 
 
         /** Converts [Task] to JSON string representation */
@@ -143,15 +145,15 @@ class TaskWorker(
             task: Task,
             status: TaskStatus,
             prefs: SharedPreferences,
-            taskException: TaskException? =
-                null
+            taskException: TaskException? = null,
+            responseBody: String? = null
         ) {
-            val retryNeeded = status == TaskStatus.failed && task.retriesRemaining > 0
-            // if task is in final state, process a final progressUpdate
             // A 'failed' progress update is only provided if
             // a retry is not needed: if it is needed, a `waitingToRetry` progress update
             // will be generated on the Dart side
+            val retryNeeded = status == TaskStatus.failed && task.retriesRemaining > 0
             var canSendStatusUpdate = true  // may become false for cancellations
+            // if task is in final state, process a final progressUpdate
             when (status) {
                 TaskStatus.complete -> processProgressUpdate(
                     task, 1.0, prefs
@@ -190,8 +192,13 @@ class TaskWorker(
                 val arg: Any = if (status == TaskStatus.failed) mutableListOf(
                     status.ordinal,
                     finalTaskException.type.typeString,
-                    finalTaskException.description, finalTaskException.httpResponseCode
-                ) else status.ordinal
+                    finalTaskException.description,
+                    finalTaskException.httpResponseCode,
+                    responseBody
+                ) else mutableListOf(
+                    status.ordinal,
+                    if (status.isFinalState()) responseBody else null
+                )
                 if (!postOnBackgroundChannel("statusUpdate", task, arg)) {
                     // unsuccessful post, so store in local prefs (without exception info)
                     Log.d(TAG, "Could not post status update -> storing locally")
@@ -246,13 +253,14 @@ class TaskWorker(
          * Sends progress update via the background channel to Flutter, if requested
          */
         suspend fun processProgressUpdate(
-            task: Task, progress: Double, prefs: SharedPreferences, expectedFileSize: Long = -1
+            task: Task, progress: Double, prefs: SharedPreferences, expectedFileSize: Long = -1,
+            downloadSpeed: Double = -1.0, timeRemaining: Long = -1000
         ) {
             if (task.providesProgressUpdates()) {
                 if (!postOnBackgroundChannel(
                         "progressUpdate",
                         task,
-                        mutableListOf(progress, expectedFileSize)
+                        mutableListOf(progress, expectedFileSize, downloadSpeed, timeRemaining)
                     )
                 ) {
                     // unsuccessful post, so store in local prefs
@@ -272,7 +280,6 @@ class TaskWorker(
          * Send 'canResume' message via the background channel to Flutter
          */
         suspend fun processCanResume(task: Task, canResume: Boolean) {
-            taskCanResume = canResume
             postOnBackgroundChannel("canResume", task, canResume)
         }
 
@@ -355,7 +362,7 @@ class TaskWorker(
          * Returns whether [string] is composed entirely of ASCII-compatible characters
          */
         private fun isPlainAscii(string: String): Boolean {
-            return asciiOnly.matches(string)
+            return asciiOnlyRegEx.matches(string)
         }
 
         /**
@@ -367,7 +374,7 @@ class TaskWorker(
             // follow this at all. Instead, they URL-encode `\r`, `\n`, and `\r\n` as
             // `\r\n`; URL-encode `"`; and do nothing else (even for `%` or non-ASCII
             // characters). We follow their behavior.
-            return value.replace(newlineRegExp, "%0D%0A").replace("\"", "%22")
+            return value.replace(newlineRegEx, "%0D%0A").replace("\"", "%22")
         }
 
         /**
@@ -378,10 +385,14 @@ class TaskWorker(
         }
     }
 
-    // properties related to pause/resume functionality
-    private var bytesTotal: Long = 0
+    // properties related to pause/resume functionality and progress
+    private var bytesTotal = 0L
+    private var bytesTotalAtLastProgressUpdate = 0L
     private var startByte = 0L
+    private var lastProgressUpdateTime = 0L // in millis
+    private var networkSpeed = -1.0 // in MB/s
     private var isTimedOut = false
+    private var taskCanResume = false
 
     // properties related to notifications
     private var notificationConfigJsonString: String? = null
@@ -389,13 +400,24 @@ class TaskWorker(
     private var notificationId = 0
     private var notificationProgress = 2.0 // indeterminate
 
+    private var taskException: TaskException? = null
+    private var responseBody: String? = null
+    private var runInForegroundFileSize: Int = -1
+    private var canRunInForeground = false
+    private var runInForeground = false
+
     private lateinit var prefs: SharedPreferences
 
+    /**
+     * Worker execution entrypoint
+     */
     override suspend fun doWork(): Result {
         prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+        runInForegroundFileSize =
+            prefs.getInt(BackgroundDownloaderPlugin.keyConfigForegroundFileSize, -1)
         withContext(Dispatchers.IO) {
             Timer().schedule(taskTimeoutMillis) {
-                isTimedOut = true
+                isTimedOut = true // triggers .failed in [TransferBytes] method if not runInForeground
             }
             val gson = Gson()
             val taskJsonMapString = inputData.getString(keyTask)
@@ -407,6 +429,8 @@ class TaskWorker(
                 if (notificationConfigJsonString != null) BackgroundDownloaderPlugin.gson.fromJson(
                     notificationConfigJsonString, NotificationConfig::class.java
                 ) else null
+            canRunInForeground = runInForegroundFileSize >= 0 &&
+                    notificationConfig?.running != null // must have notification
             // pre-process resume
             val requiredStartByte = inputData.getLong(keyStartByte, 0)
             var isResume = requiredStartByte != 0L
@@ -423,7 +447,7 @@ class TaskWorker(
             }
             updateNotification(task, notificationTypeForTaskStatus(TaskStatus.running))
             val status = doTask(task, isResume, tempFilePath, requiredStartByte)
-            processStatusUpdate(task, status, prefs, taskException)
+            processStatusUpdate(task, status, prefs, taskException, responseBody)
             updateNotification(task, notificationTypeForTaskStatus(status))
         }
         return Result.success()
@@ -433,10 +457,29 @@ class TaskWorker(
     private fun determineIfResumeIsPossible(
         tempFilePath: String, requiredStartByte: Long
     ): Boolean {
-        if (File(tempFilePath).exists()) {
-            if (File(tempFilePath).length() == requiredStartByte) {
+        val tempFile = File(tempFilePath)
+        if (tempFile.exists()) {
+            val tempFileLength = tempFile.length()
+            if (tempFileLength == requiredStartByte) {
                 return true
             } else {
+                // attempt to truncate the file to the expected size
+                Log.d(
+                    TAG,
+                    "File length = ${tempFile.length()} vs requiredStartByte = $requiredStartByte"
+                )
+                if (tempFileLength > requiredStartByte && Build.VERSION.SDK_INT >= 26) {
+                    try {
+                        val fileChannel =
+                            FileChannel.open(tempFile.toPath(), StandardOpenOption.WRITE)
+                        fileChannel.truncate(requiredStartByte)
+                        fileChannel.close()
+                        Log.d(TAG, "Truncated temp file to desired length")
+                        return true
+                    } catch (e: IOException) {
+                        e.printStackTrace()
+                    }
+                }
                 Log.i(TAG, "Partially downloaded file is corrupted, resume not possible")
             }
         } else {
@@ -454,10 +497,28 @@ class TaskWorker(
         try {
             val urlString = task.url
             val url = URL(urlString)
+            val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+            val requestTimeoutSeconds =
+                prefs.getInt(BackgroundDownloaderPlugin.keyConfigRequestTimeout, 60)
+            val proxyAddress =
+                prefs.getString(BackgroundDownloaderPlugin.keyConfigProxyAddress, null)
+            val proxyPort = prefs.getInt(BackgroundDownloaderPlugin.keyConfigProxyPort, 0)
+            val proxy = if (proxyAddress != null && proxyPort != 0) Proxy(
+                Proxy.Type.HTTP,
+                InetSocketAddress(proxyAddress, proxyPort)
+            ) else null
+            if (!BackgroundDownloaderPlugin.haveLoggedProxyMessage) {
+                Log.i(
+                    TAG,
+                    if (proxy == null) "Not using proxy for any task"
+                    else "Using proxy $proxyAddress:$proxyPort for all tasks"
+                )
+                BackgroundDownloaderPlugin.haveLoggedProxyMessage = true
+            }
             with(withContext(Dispatchers.IO) {
-                url.openConnection()
+                url.openConnection(proxy ?: Proxy.NO_PROXY)
             } as HttpURLConnection) {
-                instanceFollowRedirects = true
+                connectTimeout = requestTimeoutSeconds * 1000
                 for (header in task.headers) {
                     setRequestProperty(header.key, header.value)
                 }
@@ -479,7 +540,7 @@ class TaskWorker(
     private suspend fun connectAndProcess(
         connection: HttpURLConnection, task: Task, isResume: Boolean, tempFilePath: String
     ): TaskStatus {
-        val filePath = task.filePath(applicationContext)
+        val filePath = task.filePath(applicationContext) // "" for MultiUploadTask
         try {
             connection.requestMethod = task.httpRequestMethod
             if (task.isDownloadTask()) {
@@ -497,16 +558,21 @@ class TaskWorker(
             setTaskException(e)
             when (e) {
                 is FileSystemException -> Log.w(
-                    TAG, "Filesystem exception for url ${task.url} and $filePath: ${e.message}"
+                    TAG, "Filesystem exception for taskId ${task.taskId} and $filePath: ${
+                        e
+                            .message
+                    }"
                 )
 
                 is SocketException -> Log.i(
-                    TAG, "Socket exception for url ${task.url} and $filePath: ${e.message}"
+                    TAG,
+                    "Socket exception for taskId ${task.taskId} and $filePath: ${e.message}"
                 )
 
                 is CancellationException -> {
                     Log.i(
-                        TAG, "Job cancelled for url ${task.url} and $filePath: ${e.message}"
+                        TAG,
+                        "Job cancelled for taskId ${task.taskId} and $filePath: ${e.message}"
                     )
                     deleteTempFile(tempFilePath)
                     return TaskStatus.canceled
@@ -515,7 +581,7 @@ class TaskWorker(
                 else -> {
                     Log.w(
                         TAG,
-                        "Error for url ${task.url} and $filePath: ${e.message}"
+                        "Error for taskId ${task.taskId} and $filePath: ${e.message}"
                     )
                     taskException = TaskException(
                         ExceptionType.general, description =
@@ -523,6 +589,9 @@ class TaskWorker(
                     )
                 }
             }
+        } finally {
+            // clean up remaining bytes tracking
+            BackgroundDownloaderPlugin.remainingBytesToDownload.remove(task.taskId)
         }
         deleteTempFile(tempFilePath)
         return TaskStatus.failed
@@ -539,13 +608,14 @@ class TaskWorker(
         isResumeParam: Boolean,
         tempFilePath: String
     ): TaskStatus {
-        Log.d(TAG, "Download for taskId ${task.taskId}")
         if (connection.responseCode in 200..206) {
             if (task.allowPause) {
                 val acceptRangesHeader = connection.headerFields["Accept-Ranges"]
+                taskCanResume =
+                    acceptRangesHeader?.first() == "bytes" || connection.responseCode == 206
                 processCanResume(
                     task,
-                    acceptRangesHeader?.first() == "bytes" || connection.responseCode == 206
+                    taskCanResume
                 )
             }
             val isResume =
@@ -555,11 +625,25 @@ class TaskWorker(
                 return TaskStatus.failed
             }
             val tempFile = File(tempFilePath)
+            val contentLength = connection.contentLengthLong
+            if (insufficientSpace(applicationContext, contentLength)) {
+                Log.i(
+                    TAG,
+                    "Insufficient space to store the file to be downloaded for taskId ${task.taskId}"
+                )
+                taskException = TaskException(
+                    ExceptionType.fileSystem,
+                    description = "Insufficient space to store the file to be downloaded"
+                )
+                return TaskStatus.failed
+            }
+            BackgroundDownloaderPlugin.remainingBytesToDownload[task.taskId] = contentLength
+            determineRunInForeground(task, contentLength)
             val transferBytesResult: TaskStatus
             BufferedInputStream(connection.inputStream).use { inputStream ->
                 FileOutputStream(tempFile, isResume).use { outputStream ->
                     transferBytesResult = transferBytes(
-                        inputStream, outputStream, connection.contentLengthLong, task
+                        inputStream, outputStream, contentLength, task
                     )
                 }
             }
@@ -621,7 +705,10 @@ class TaskWorker(
                     if (!task.allowPause) {
                         Log.i(TAG, "Task ${task.taskId} timed out")
                         taskException =
-                            TaskException(ExceptionType.connection, description = "Task timed out")
+                            TaskException(
+                                ExceptionType.connection,
+                                description = "Task timed out"
+                            )
                         return TaskStatus.failed
                     }
                     if (taskCanResume) {
@@ -657,12 +744,13 @@ class TaskWorker(
                 TAG,
                 "Response code ${connection.responseCode} for download from  ${task.url} to $filePath"
             )
-            val responseContent = responseContent(connection)
+            val errorContent = responseErrorContent(connection)
             taskException = TaskException(
                 ExceptionType.httpResponse, httpResponseCode = connection.responseCode,
-                description = if (responseContent?.isNotEmpty() == true) responseContent else connection.responseMessage
+                description = if (errorContent?.isNotEmpty() == true) errorContent else connection.responseMessage
             )
             return if (connection.responseCode == 404) {
+                responseBody = errorContent
                 TaskStatus.notFound
             } else {
                 TaskStatus.failed
@@ -671,16 +759,12 @@ class TaskWorker(
     }
 
 
-    /** Process the upload of the file
+    /**
+     * Process the upload of the file
      *
      * If the [Task.post] field is set to "binary" then the file will be uploaded as a byte stream POST
-     * and if the Content-Type header is not set, will attempt to derive it from the file extension.
-     * Content-Disposition will be set to "attachment" with filename [Task.filename].
      *
-     * If the [Task.post] field is not "binary" then the file will be uploaded as a multipart POST
-     * with the name and filename set to [Task.filename] and the content type derived from the
-     * file extension
-     * Note that the actual Content-Type of the request will be multipart/form-data.
+     * If the [Task.post] field is not "binary" then the file(s) will be uploaded as a multipart POST
      *
      * Note that the [Task.post] field is just used to set whether this is a binary or multipart
      * upload. The bytes that will be posted are derived from the file to be uploaded.
@@ -691,6 +775,63 @@ class TaskWorker(
         connection: HttpURLConnection, task: Task, filePath: String
     ): TaskStatus {
         connection.doOutput = true
+        val transferBytesResult =
+            if (task.post?.lowercase() == "binary") {
+                processBinaryUpload(connection, task, filePath)
+            } else {
+                processMultipartUpload(connection, task, filePath)
+            }
+        when (transferBytesResult) {
+            TaskStatus.canceled -> {
+                Log.i(TAG, "Canceled taskId ${task.taskId} for $filePath")
+                return TaskStatus.canceled
+            }
+
+            TaskStatus.failed -> {
+                return TaskStatus.failed
+            }
+
+            TaskStatus.complete -> {
+                responseBody = responseBodyContent(connection)
+                if (connection.responseCode in 200..206) {
+                    Log.i(
+                        TAG, "Successfully uploaded taskId ${task.taskId} from $filePath"
+                    )
+                    return TaskStatus.complete
+                }
+                Log.i(
+                    TAG,
+                    "Response code ${connection.responseCode} for upload of $filePath to ${task.url}"
+                )
+                val errorContent = responseErrorContent(connection)
+                taskException = TaskException(
+                    ExceptionType.httpResponse, httpResponseCode = connection.responseCode,
+                    description = if (errorContent?.isNotEmpty() == true) errorContent else connection.responseMessage
+                )
+                return if (connection.responseCode == 404) {
+                    TaskStatus.notFound
+                } else {
+                    TaskStatus.failed
+                }
+            }
+
+            else -> {
+                return TaskStatus.failed
+            }
+        }
+    }
+
+    /**
+     * Process the binary upload of the file
+     *
+     * Content-Disposition will be set to "attachment" with filename [Task.filename], and the
+     * mime-type will be set to [Task.mimeType]
+     *
+     * Returns the [TaskStatus]
+     */
+    private suspend fun processBinaryUpload(
+        connection: HttpURLConnection, task: Task, filePath: String
+    ): TaskStatus {
         val file = File(filePath)
         if (!file.exists() || !file.isFile) {
             Log.w(TAG, "File $filePath does not exist or is not a file")
@@ -709,109 +850,125 @@ class TaskWorker(
             )
             return TaskStatus.failed
         }
-        var transferBytesResult: TaskStatus
-        if (task.post?.lowercase() == "binary") {
-            // binary file upload posts file bytes directly
-            // set Content-Type based on file extension
-            Log.d(TAG, "Binary upload for taskId ${task.taskId}")
-            connection.setRequestProperty("Content-Type", task.mimeType)
-            connection.setRequestProperty(
-                "Content-Disposition", "attachment; filename=\"" + task.filename + "\""
-            )
-            connection.setRequestProperty("Content-Length", fileSize.toString())
-            connection.setFixedLengthStreamingMode(fileSize)
-            withContext(Dispatchers.IO) {
-                FileInputStream(file).use { inputStream ->
-                    DataOutputStream(connection.outputStream.buffered()).use { outputStream ->
-                        transferBytesResult =
-                            transferBytes(inputStream, outputStream, fileSize, task)
-                    }
-                }
-            }
-        } else {
-            // multipart file upload using Content-Type multipart/form-data
-            Log.d(TAG, "Multipart upload for taskId ${task.taskId}")
-            // field portion of the multipart
-            var fieldString = ""
-            for (entry in task.fields.entries) {
-                fieldString += fieldEntry(entry.key, entry.value)
-            }
-            // file portion of the multipart
-            val contentDispositionString =
-                "Content-Disposition: form-data; name=\"${browserEncode(task.fileField)}\"; " +
-                        "filename=\"${browserEncode(task.filename)}\""
-            val contentTypeString = "Content-Type: ${task.mimeType}"
-            // determine the content length of the multi-part data
-            val contentLength =
-                lengthInBytes(fieldString) + 2 * boundary.length + 6 * lineFeed.length +
-                        lengthInBytes(contentDispositionString) + contentTypeString.length +
-                        3 * "--".length + fileSize
-            connection.setRequestProperty("Accept-Charset", "UTF-8")
-            connection.setRequestProperty("Connection", "Keep-Alive")
-            connection.setRequestProperty("Cache-Control", "no-cache")
-            connection.setRequestProperty(
-                "Content-Type", "multipart/form-data; boundary=$boundary"
-            )
-            connection.setRequestProperty("Content-Length", contentLength.toString())
-            connection.setFixedLengthStreamingMode(contentLength)
-            connection.useCaches = false
-            withContext(Dispatchers.IO) {
-                FileInputStream(file).use { inputStream ->
-                    DataOutputStream(connection.outputStream).use { outputStream ->
-                        val writer = outputStream.writer()
-                        writer.append(fieldString).append("--${boundary}").append(lineFeed)
-                            .append(contentDispositionString).append(lineFeed)
-                            .append(contentTypeString).append(lineFeed).append(lineFeed).flush()
-                        transferBytesResult =
-                            transferBytes(inputStream, outputStream, fileSize, task)
-                        if (transferBytesResult == TaskStatus.complete) {
-                            writer.append(lineFeed).append("--${boundary}--").append(lineFeed)
-                        }
-                        writer.close()
-                    }
+        determineRunInForeground(task, fileSize)
+        // binary file upload posts file bytes directly
+        // set Content-Type based on file extension
+        Log.d(TAG, "Binary upload for taskId ${task.taskId}")
+        connection.setRequestProperty("Content-Type", task.mimeType)
+        connection.setRequestProperty(
+            "Content-Disposition", "attachment; filename=\"" + task.filename + "\""
+        )
+        connection.setRequestProperty("Content-Length", fileSize.toString())
+        connection.setFixedLengthStreamingMode(fileSize)
+        return withContext(Dispatchers.IO) {
+            FileInputStream(file).use { inputStream ->
+                DataOutputStream(connection.outputStream.buffered()).use { outputStream ->
+                    return@withContext transferBytes(inputStream, outputStream, fileSize, task)
                 }
             }
         }
-        when (transferBytesResult) {
-            TaskStatus.canceled -> {
-                Log.i(TAG, "Canceled taskId ${task.taskId} for $filePath")
-                return TaskStatus.canceled
-            }
+    }
 
-            TaskStatus.failed -> {
+    /**
+     * Process the multi-part upload of one or more files, and potential form fields
+     *
+     * Form fields are taken from [Task.fields]. If only one file is to be uploaded,
+     * then the [filePath] determines the file, and [Task.fileField] and [Task.mimeType]
+     * are used to set the file field name and mime type respectively.
+     * If [filePath] is empty, then the list of fileField, filePath and mimeType are
+     * extracted from the [Task.fileField], [Task.filename] and [Task.mimeType] (which
+     * for MultiUploadTasks contain a JSON encoded list of strings).
+     *
+     * The total content length is calculated from the sum of all parts, the connection
+     * is set up, and the bytes for each part are transferred to the host.
+     *
+     * Returns the [TaskStatus]
+     */
+    private suspend fun processMultipartUpload(
+        connection: HttpURLConnection, task: Task,
+        filePath: String
+    ): TaskStatus {
+        // field portion of the multipart
+        var fieldsString = ""
+        for (entry in task.fields.entries) {
+            fieldsString += fieldEntry(entry.key, entry.value)
+        }
+        // File portion of the multi-part
+        // Assumes list of files. If only one file, that becomes a list of length one.
+        // For each file, determine contentDispositionString, contentTypeString
+        // and file length, so that we can calculate total size of upload
+        val separator = "$lineFeed--$boundary$lineFeed" // between files
+        val terminator = "$lineFeed--$boundary--$lineFeed" // after last file
+        val filesData = if (filePath.isNotEmpty()) {
+            listOf(
+                Triple(task.fileField, filePath, task.mimeType)
+            )
+        } else {
+            task.extractFilesData(applicationContext)
+        }
+        val contentDispositionStrings = ArrayList<String>()
+        val contentTypeStrings = ArrayList<String>()
+        val fileLengths = ArrayList<Long>()
+        for ((fileField, path, mimeType) in filesData) {
+            val file = File(path)
+            if (!file.exists() || !file.isFile) {
+                Log.w(TAG, "File at $path does not exist")
+                taskException = TaskException(
+                    ExceptionType.fileSystem,
+                    description = "File to upload does not exist: $path"
+                )
                 return TaskStatus.failed
             }
-
-            TaskStatus.complete -> {
-                if (connection.responseCode in 200..206) {
-                    Log.i(
-                        TAG, "Successfully uploaded taskId ${task.taskId} from $filePath"
-                    )
-                    return TaskStatus.complete
+            contentDispositionStrings.add(
+                "Content-Disposition: form-data; name=\"${browserEncode(fileField)}\"; " +
+                        "filename=\"${browserEncode(file.name)}\"$lineFeed"
+            )
+            contentTypeStrings.add("Content-Type: $mimeType$lineFeed$lineFeed")
+            fileLengths.add(file.length())
+        }
+        val fileDataLength =
+            contentDispositionStrings.sumOf { string: String -> lengthInBytes(string) } +
+                    contentTypeStrings.sumOf { string: String -> string.length } +
+                    fileLengths.sum() + separator.length * contentDispositionStrings.size + 2
+        val contentLength =
+            lengthInBytes(fieldsString) + "--$boundary$lineFeed".length + fileDataLength
+        determineRunInForeground(task, contentLength)
+        // setup the connection
+        connection.setRequestProperty("Accept-Charset", "UTF-8")
+        connection.setRequestProperty("Connection", "Keep-Alive")
+        connection.setRequestProperty("Cache-Control", "no-cache")
+        connection.setRequestProperty(
+            "Content-Type", "multipart/form-data; boundary=$boundary"
+        )
+        connection.setRequestProperty("Content-Length", contentLength.toString())
+        connection.setFixedLengthStreamingMode(contentLength)
+        connection.useCaches = false
+        // transfer the bytes
+        return withContext(Dispatchers.IO) {
+            DataOutputStream(connection.outputStream).use { outputStream ->
+                val writer = outputStream.writer()
+                // write form fields
+                writer.append(fieldsString).append("--${boundary}").append(lineFeed)
+                // write each file
+                for (i in filesData.indices) {
+                    FileInputStream(filesData[i].second).use { inputStream ->
+                        writer.append(contentDispositionStrings[i])
+                            .append(contentTypeStrings[i]).flush()
+                        val transferBytesResult =
+                            transferBytes(inputStream, outputStream, contentLength, task)
+                        if (transferBytesResult == TaskStatus.complete) {
+                            if (i < filesData.size - 1) {
+                                writer.append(separator)
+                            } else
+                                writer.append(terminator)
+                        } else {
+                            return@withContext transferBytesResult
+                        }
+                    }
                 }
-                Log.i(
-                    TAG,
-                    "Response code ${connection.responseCode} for upload of $filePath to ${task.url}"
-                )
-                val responseContent = responseContent(connection)
-                taskException = TaskException(
-                    ExceptionType.httpResponse, httpResponseCode = connection.responseCode,
-                    description = if (responseContent?.isNotEmpty() == true) responseContent else connection.responseMessage
-                )
-                taskException = TaskException(
-                    ExceptionType.httpResponse, httpResponseCode = connection.responseCode,
-                    description = connection.responseMessage
-                )
-                return if (connection.responseCode == 404) {
-                    TaskStatus.notFound
-                } else {
-                    TaskStatus.failed
-                }
+                writer.close()
             }
-
-            else -> {
-                return TaskStatus.failed
-            }
+            return@withContext TaskStatus.complete
         }
     }
 
@@ -830,44 +987,99 @@ class TaskWorker(
         var lastProgressUpdate = 0.0
         var nextProgressUpdateTime = 0L
         var numBytes: Int
-        return withContext(Dispatchers.IO) {
+        return withContext(Dispatchers.Default) {
+            var readerJob: Job? = null
+            var testerJob: Job? = null
+            val doneCompleter = CompletableDeferred<TaskStatus>()
             try {
-                while (inputStream.read(dataBuffer, 0, bufferSize)
-                        .also { numBytes = it } != -1
-                ) {
-                    // check if task is stopped (canceled), paused or timed out
-                    if (isStopped) {
-                        return@withContext TaskStatus.canceled
-                    }
-                    // 'pause' is signalled by adding the taskId to a static list
-                    if (BackgroundDownloaderPlugin.pausedTaskIds.contains(task.taskId)) {
-                        return@withContext TaskStatus.paused
-                    }
-                    if (isTimedOut) {
-                        return@withContext TaskStatus.enqueued // special use of this status, see [processDownload]
-                    }
-                    if (numBytes > 0) {
-                        outputStream.write(dataBuffer, 0, numBytes)
-                        bytesTotal += numBytes
-                    }
-                    val progress = min(
-                        (bytesTotal + startByte).toDouble() / (contentLength + startByte), 0.999
-                    )
-                    if (contentLength > 0 && progress - lastProgressUpdate > 0.02 && currentTimeMillis() > nextProgressUpdateTime) {
-                        processProgressUpdate(task, progress, prefs, contentLength)
-                        updateNotification(
-                            task, notificationTypeForTaskStatus(TaskStatus.running), progress
+                readerJob = launch(Dispatchers.IO) {
+                    while (inputStream.read(
+                            dataBuffer, 0,
+                            bufferSize
                         )
-                        lastProgressUpdate = progress
-                        nextProgressUpdateTime = currentTimeMillis() + 500
+                            .also { numBytes = it } != -1
+                    ) {
+                        if (!isActive) {
+                            doneCompleter.complete(TaskStatus.failed)
+                            break
+                        }
+                        if (numBytes > 0) {
+                            outputStream.write(dataBuffer, 0, numBytes)
+                            bytesTotal += numBytes
+                            val remainingBytes =
+                                BackgroundDownloaderPlugin.remainingBytesToDownload[task.taskId]
+                            if (remainingBytes != null) {
+                                BackgroundDownloaderPlugin.remainingBytesToDownload[task.taskId] =
+                                    remainingBytes - numBytes
+                            }
+                        }
+                        val expectedFileSize = contentLength + startByte
+                        val progress = doubleMin(
+                            (bytesTotal + startByte).toDouble() / expectedFileSize,
+                            0.999
+                        )
+                        if (contentLength > 0 && progress - lastProgressUpdate > 0.02 && currentTimeMillis() > nextProgressUpdateTime) {
+                            // calculate download speed and time remaining
+                            val now = currentTimeMillis()
+                            val timeSinceLastUpdate = now - lastProgressUpdateTime
+                            lastProgressUpdateTime = now
+                            val bytesSinceLastUpdate = bytesTotal - bytesTotalAtLastProgressUpdate
+                            bytesTotalAtLastProgressUpdate = bytesTotal
+                            val currentNetworkSpeed: Double = if (timeSinceLastUpdate > 3600000)
+                                -1.0 else bytesSinceLastUpdate / (timeSinceLastUpdate * 1000.0)
+                            networkSpeed =
+                                if (networkSpeed == -1.0) currentNetworkSpeed else (networkSpeed * 3.0 + currentNetworkSpeed) / 4.0
+                            val remainingBytes = (1 - progress) * expectedFileSize
+                            val timeRemaining: Long =
+                                if (networkSpeed == -1.0) -1000 else (remainingBytes / networkSpeed / 1000).toLong()
+                            // update progress and notification
+                            processProgressUpdate(
+                                task,
+                                progress,
+                                prefs,
+                                expectedFileSize,
+                                networkSpeed,
+                                timeRemaining
+                            )
+                            updateNotification(
+                                task, notificationTypeForTaskStatus(TaskStatus.running),
+                                progress, timeRemaining
+                            )
+                            lastProgressUpdate = progress
+                            nextProgressUpdateTime = currentTimeMillis() + 500
+                        }
+                    }
+                    doneCompleter.complete(TaskStatus.complete)
+                }
+                testerJob = launch {
+                    while (isActive) {
+                        // check if task is stopped (canceled), paused or timed out
+                        if (isStopped) {
+                            doneCompleter.complete(TaskStatus.failed)
+                            break
+                        }
+                        // 'pause' is signalled by adding the taskId to a static list
+                        if (BackgroundDownloaderPlugin.pausedTaskIds.contains(task.taskId)) {
+                            doneCompleter.complete(TaskStatus.paused)
+                            break
+                        }
+                        if (isTimedOut && !runInForeground) {
+                            // special use of .enqueued status, see [processDownload]
+                            doneCompleter.complete(TaskStatus.enqueued)
+                            break
+                        }
+                        delay(100)
                     }
                 }
+                return@withContext doneCompleter.await()
             } catch (e: Exception) {
-                Log.i(TAG, "Exception for ${task.taskId}: $e")
+                Log.i(TAG, "Exception for taskId ${task.taskId}: $e")
                 setTaskException(e)
                 return@withContext TaskStatus.failed
+            } finally {
+                readerJob?.cancelAndJoin()
+                testerJob?.cancelAndJoin()
             }
-            return@withContext TaskStatus.complete
         }
     }
 
@@ -917,7 +1129,10 @@ class TaskWorker(
         } catch (e: IOException) {
             Log.i(TAG, "Could not truncate temp file")
             taskException =
-                TaskException(ExceptionType.resume, description = "Could not truncate temp file")
+                TaskException(
+                    ExceptionType.resume,
+                    description = "Could not truncate temp file"
+                )
             return false
         }
         return true
@@ -957,10 +1172,12 @@ class TaskWorker(
      * The [progress] field is only relevant for [NotificationType.running]. If progress is
      * negative no progress bar will be shown. If progress > 1 an indeterminate progress bar
      * will be shown
+     * [networkSpeed] and [timeRemaining] are only relevant for [NotificationType.running]
      */
     @SuppressLint("MissingPermission")
-    private fun updateNotification(
-        task: Task, notificationType: NotificationType, progress: Double = 2.0
+    private suspend fun updateNotification(
+        task: Task, notificationType: NotificationType, progress: Double = 2.0,
+        timeRemaining: Long = -1000
     ) {
         val notification = when (notificationType) {
             NotificationType.running -> notificationConfig?.running
@@ -1003,11 +1220,21 @@ class TaskWorker(
         notificationProgress =
             if (notificationType == NotificationType.paused) notificationProgress else progress
         // title and body interpolation of {filename}, {progress} and {metadata}
-        val title = replaceTokens(notification.title, task, notificationProgress)
+        val title = replaceTokens(
+            notification.title,
+            task,
+            notificationProgress,
+            timeRemaining
+        )
         if (title.isNotEmpty()) {
             builder.setContentTitle(title)
         }
-        val body = replaceTokens(notification.body, task, notificationProgress)
+        val body = replaceTokens(
+            notification.body,
+            task,
+            notificationProgress,
+            timeRemaining
+        )
         if (body.isNotEmpty()) {
             builder.setContentText(body)
         }
@@ -1042,10 +1269,24 @@ class TaskWorker(
                     return
                 }
             }
-            notify(notificationId, builder.build())
+            val androidNotification = builder.build()
+            if (runInForeground) {
+                if (notificationType == NotificationType.running) {
+                    setForeground(ForegroundInfo(notificationId, androidNotification))
+                } else {
+                    // to prevent the 'not running' notification getting killed as the foreground
+                    // process is terminated, this notification is shown regularly, but with
+                    // a delay
+                    CoroutineScope(Dispatchers.Main).launch {
+                        delay(200)
+                        notify(notificationId, androidNotification)
+                    }
+                }
+            } else {
+                notify(notificationId, androidNotification)
+            }
         }
     }
-
 
     /**
      * Add action to notification via buttons or tap
@@ -1063,7 +1304,9 @@ class TaskWorker(
             )
             // add tap action for all notifications
             val tapIntent =
-                applicationContext.packageManager.getLaunchIntentForPackage(applicationContext.packageName)
+                applicationContext.packageManager.getLaunchIntentForPackage(
+                    applicationContext.packageName
+                )
             if (tapIntent != null) {
                 tapIntent.apply {
                     action = NotificationRcvr.actionTap
@@ -1189,15 +1432,44 @@ class TaskWorker(
     }
 
     /**
-     * Replace special tokens {filename}, {metadata} and {progress} with their respective values
+     * Replace special tokens {filename}, {metadata}, {progress}, {networkSpeed},
+     * {timeRemaining} with their respective values
      */
-    private fun replaceTokens(input: String, task: Task, progress: Double): String {
+    private fun replaceTokens(
+        input: String,
+        task: Task,
+        progress: Double,
+        timeRemaining: Long
+    ): String {
+        // filename and metadata
         val output =
             fileNameRegEx.replace(metaDataRegEx.replace(input, task.metaData), task.filename)
+        // progress
         val progressString =
             if (progress in 0.0..1.0) (progress * 100).roundToInt().toString() + "%"
             else ""
-        return progressRegEx.replace(output, progressString)
+        val output2 = progressRegEx.replace(output, progressString)
+        // download speed
+        val networkSpeedString =
+            if (networkSpeed <= 0.0) "-- MB/s" else if (networkSpeed > 1) "${networkSpeed.roundToInt()} MB/s" else "${(networkSpeed * 1000).roundToInt()} kB/s"
+        val output3 = networkSpeedRegEx.replace(output2, networkSpeedString)
+        // time remaining
+        val hours = timeRemaining.div(3600000L)
+        val minutes = (timeRemaining.mod(3600000L)).div(60000L)
+        val seconds = (timeRemaining.mod(60000L)).div(1000L)
+        val timeRemainingString = if (timeRemaining < 0) "--:--" else if (hours > 0)
+            String.format(
+                "%02d:%02d:%02d",
+                hours,
+                minutes,
+                seconds
+            ) else
+            String.format(
+                "%02d:%02d",
+                minutes,
+                seconds
+            )
+        return timeRemainingRegEx.replace(output3, timeRemainingString)
     }
 
     /**
@@ -1212,6 +1484,18 @@ class TaskWorker(
         }
     }
 
+    /**
+     * Determine if this task should run in the foreground
+     *
+     * Based on [canRunInForeground] and [contentLength] > [runInForegroundFileSize]
+     */
+    private fun determineRunInForeground(task: Task, contentLength: Long) {
+        runInForeground =
+            canRunInForeground && contentLength > (runInForegroundFileSize.toLong() shl 20)
+        if (runInForeground) {
+            Log.i(TAG, "TaskId ${task.taskId} will run in foreground")
+        }
+    }
 
     private fun deleteTempFile(tempFilePath: String) {
         if (tempFilePath.isNotEmpty()) {
@@ -1225,19 +1509,35 @@ class TaskWorker(
     }
 
     /**
-     * Return the response's content as a String, or null if unable
+     * Return the response's error content as a String, or null if unable
      */
-    private fun responseContent(connection: HttpURLConnection): String? {
+    private fun responseErrorContent(connection: HttpURLConnection): String? {
         try {
             return connection.errorStream.bufferedReader().readText()
         } catch (e: Exception) {
             Log.i(
                 TAG,
-                "Could not read response content from httpResponseCode ${connection.responseCode}: $e"
+                "Could not read response error content from httpResponseCode ${connection.responseCode}: $e"
             )
         }
         return null
     }
+
+    /**
+     * Return the response's body content as a String, or null if unable
+     */
+    private fun responseBodyContent(connection: HttpURLConnection): String? {
+        try {
+            return connection.inputStream.bufferedReader().readText()
+        } catch (e: Exception) {
+            Log.i(
+                TAG,
+                "Could not read response body from httpResponseCode ${connection.responseCode}: $e"
+            )
+        }
+        return null
+    }
+
 
     /**
      * Set the [taskException] variable based on Exception [e]
@@ -1263,5 +1563,3 @@ fun getTaskMap(prefs: SharedPreferences): MutableMap<String, Any> {
         jsonString, BackgroundDownloaderPlugin.jsonMapType
     ).toMutableMap()
 }
-
-

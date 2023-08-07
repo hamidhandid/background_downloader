@@ -15,8 +15,8 @@ struct NotificationContents : Codable {
     let body: String
     
     init(json: [String:Any]) {
-        title = json["title"] as! String
-        body = json["body"] as! String
+        title = json["title"] as? String ?? ""
+        body = json["body"] as? String ?? ""
     }
 }
 
@@ -48,6 +48,10 @@ enum NotificationCategory : String, CaseIterable {
 let ourCategories = NotificationCategory.allCases.map { $0.rawValue }
 
 func updateNotification(task: Task, notificationType: NotificationType, notificationConfig: NotificationConfig?) {
+    if !Downloader.haveregisteredNotificationCategories {
+        registerNotificationCategories()
+        Downloader.haveregisteredNotificationCategories = true
+    }
     let center = UNUserNotificationCenter.current()
     center.getNotificationSettings { settings in
         guard (settings.authorizationStatus == .authorized) else { return }
@@ -114,31 +118,39 @@ func notificationTypeForTaskStatus(status: TaskStatus) -> NotificationType {
 let fileNameRegEx = try! NSRegularExpression(pattern: "\\{filename\\}", options: NSRegularExpression.Options.caseInsensitive)
 let progressRegEx = try! NSRegularExpression(pattern: "\\{progress\\}", options: NSRegularExpression.Options.caseInsensitive)
 let metaDataRegEx = try! NSRegularExpression(pattern: "\\{metadata\\}", options: NSRegularExpression.Options.caseInsensitive)
+let networkSpeedRegEx = try! NSRegularExpression(pattern: "\\{networkSpeed\\}", options: NSRegularExpression.Options.caseInsensitive)
+let timeRemainingRegEx = try! NSRegularExpression(pattern: "\\{timeRemaining\\}", options: NSRegularExpression.Options.caseInsensitive)
 
 /// Replace special tokens {filename} and {metadata} with their respective values
 func replaceTokens(input: String, task: Task) -> String {
-    var inputString = NSMutableString()
+    let inputString = NSMutableString()
     inputString.append(input)
     metaDataRegEx.replaceMatches(in: inputString, range: NSMakeRange(0, inputString.length), withTemplate: task.metaData)
     fileNameRegEx.replaceMatches(in: inputString, range: NSMakeRange(0, inputString.length), withTemplate: task.filename)
     progressRegEx.replaceMatches(in: inputString, range: NSMakeRange(0, inputString.length), withTemplate: "")
+    networkSpeedRegEx.replaceMatches(in: inputString, range: NSMakeRange(0, inputString.length), withTemplate: "-- MB/s")
+    timeRemainingRegEx.replaceMatches(in: inputString, range: NSMakeRange(0, inputString.length), withTemplate: "--:--")
     return inputString as String
 }
 
 /// Registers notification categories and actions for the different notification types
 func registerNotificationCategories() {
+    // get values from shared preferences
+    let defaults = UserDefaults.standard
+    let localize = defaults.dictionary(forKey: Downloader.keyConfigLocalize)
+
     // define the actions
     let cancelAction = UNNotificationAction(identifier: "cancel_action",
-                                            title: "Cancel",
+                                            title: localize?["Cancel"] as? String ?? "Cancel",
                                             options: [])
     let cancelInactiveAction = UNNotificationAction(identifier: "cancel_inactive_action",
-                                                    title: "Cancel",
+                                                    title: localize?["Cancel"] as? String ?? "Cancel",
                                                     options: [])
     let pauseAction = UNNotificationAction(identifier: "pause_action",
-                                           title: "Pause",
+                                           title: localize?["Pause"] as? String ?? "Pause",
                                            options: [])
     let resumeAction = UNNotificationAction(identifier: "resume_action",
-                                            title: "Resume",
+                                            title: localize?["Resume"] as? String ?? "Resume",
                                             options: [])
     // Define the notification categories using these actions
     let runningWithPauseCategory =
